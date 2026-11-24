@@ -27,10 +27,22 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(SCRIPT_DIR, "bin")
 DEFAULT_LOG_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "VideoDownloader_Logs")
 
+# Prefer H.264 (avc1) + AAC (mp4a) for universal playback (WhatsApp, iOS, Android)
 QUALITY_FORMAT_MAP = {
-    "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-    "medium": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "worst": "worstvideo+worstaudio/worst",
+    "best": (
+        "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+        "bestvideo[ext=mp4][vcodec!^=av01]+bestaudio[ext=m4a]/"
+        "best[vcodec^=avc]/bestvideo+bestaudio/best"
+    ),
+    "medium": (
+        "bestvideo[height<=720][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+        "bestvideo[height<=720][ext=mp4][vcodec!^=av01]+bestaudio[ext=m4a]/"
+        "best[height<=720][vcodec^=avc]/bestvideo[height<=720]+bestaudio/best[height<=720]"
+    ),
+    "worst": (
+        "worstvideo[vcodec^=avc]+worstaudio[acodec^=mp4a]/"
+        "worst[vcodec^=avc]/worstvideo+worstaudio/worst"
+    ),
 }
 
 
@@ -177,16 +189,21 @@ def get_video_info(url: str, extra_args: Optional[Iterable[str]] = None) -> Opti
     return None
 
 
+def _get_ffprobe_path(ffmpeg_path: Optional[str] = None) -> str:
+    """Return path to ffprobe executable."""
+    ffprobe_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
+    if ffmpeg_path:
+        candidate = os.path.join(os.path.dirname(ffmpeg_path), ffprobe_name)
+        if os.path.exists(candidate):
+            return candidate
+    return shutil.which("ffprobe") or "ffprobe"
+
+
 def get_video_dimensions(file_path: str, ffmpeg_path: Optional[str] = None) -> str:
     """Return 'WIDTHxHEIGHT' via ffprobe, or empty string if unavailable."""
     if not file_path or not os.path.exists(file_path):
         return ""
-    ffprobe_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
-    if ffmpeg_path:
-        candidate = os.path.join(os.path.dirname(ffmpeg_path), ffprobe_name)
-        ffprobe_path = candidate if os.path.exists(candidate) else (shutil.which("ffprobe") or "ffprobe")
-    else:
-        ffprobe_path = shutil.which("ffprobe") or "ffprobe"
+    ffprobe_path = _get_ffprobe_path(ffmpeg_path)
 
     try:
         cmd = [
@@ -200,6 +217,88 @@ def get_video_dimensions(file_path: str, ffmpeg_path: Optional[str] = None) -> s
         return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return ""
+
+
+def ensure_compatible_mp4(
+    file_path: str,
+    ffmpeg_path: Optional[str] = None,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    """
+    Ensure the downloaded MP4 uses H.264 + AAC (yuv420p, faststart) so it works
+    everywhere including WhatsApp. Only transcodes if the video/audio codec
+    is incompatible (e.g., AV1 / VP9 / Opus).
+    """
+    if not file_path or not os.path.exists(file_path):
+        return file_path
+
+    ffprobe_path = _get_ffprobe_path(ffmpeg_path)
+    ffmpeg_bin = ffmpeg_path or shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return file_path
+
+    try:
+        probe_cmd = [
+            ffprobe_path,
+            "-v", "error",
+            "-show_entries", "stream=codec_type,codec_name",
+            "-of", "json",
+            file_path,
+        ]
+        probe_out = subprocess.check_output(probe_cmd, text=True, stderr=subprocess.DEVNULL)
+        streams = json.loads(probe_out).get("streams", [])
+        vcodec = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"), None)
+        acodec = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), None)
+    except Exception:
+        return file_path
+
+    needs_video_transcode = vcodec is not None and vcodec != "h264"
+    needs_audio_transcode = acodec is not None and acodec != "aac"
+    if not needs_video_transcode and not needs_audio_transcode:
+        return file_path
+
+    if logger:
+        logger.info("Transcoding %s (vcodec=%s, acodec=%s) to H.264/AAC for compatibility", file_path, vcodec, acodec)
+    if progress_callback:
+        progress_callback(99.0, "Converting video to H.264 for WhatsApp compatibility...")
+
+    base, _ext = os.path.splitext(file_path)
+    temp_out = f"{base}.compat.mp4"
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i", file_path,
+        "-c:v", "libx264" if needs_video_transcode else "copy",
+    ]
+    if needs_video_transcode:
+        cmd.extend(["-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"])
+    if acodec is not None:
+        if needs_audio_transcode:
+            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+        else:
+            cmd.extend(["-c:a", "copy"])
+    cmd.extend(["-movflags", "+faststart", temp_out])
+
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        if res.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
+            final_path = f"{base}.mp4"
+            if file_path != final_path and os.path.exists(file_path):
+                os.remove(file_path)
+            os.replace(temp_out, final_path)
+            return final_path
+    except Exception as exc:
+        if logger:
+            logger.warning("Compatibility transcode failed: %s", exc)
+    finally:
+        if os.path.exists(temp_out):
+            try:
+                os.remove(temp_out)
+            except OSError:
+                pass
+
+    return file_path
 
 
 def run_yt_dlp_download(
@@ -292,6 +391,13 @@ def run_yt_dlp_download(
         returncode = proc.wait()
         combined_output = "\n".join(output_lines)
         if returncode == 0:
+            if downloaded_path and os.path.exists(downloaded_path):
+                downloaded_path = ensure_compatible_mp4(
+                    downloaded_path,
+                    ffmpeg_path=ffmpeg_path,
+                    progress_callback=progress_callback,
+                    logger=logger,
+                )
             return True, downloaded_path, combined_output
         return False, downloaded_path, combined_output or f"yt-dlp exited with code {returncode}"
     except Exception as exc:
