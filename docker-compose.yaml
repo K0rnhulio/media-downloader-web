@@ -1,8 +1,8 @@
 services:
   media-downloader:
     build: .
-    ports:
-      - "${PORT:-8000}:${PORT:-8000}"
+    expose:
+      - "${PORT:-8000}"
     environment:
       - PORT=${PORT:-8000}
       - DOWNLOAD_DIR=/tmp/media_downloader_jobs
